@@ -55,13 +55,18 @@ return function(moduleName)
       end
 
       function module:accGradParameters(input, gradOutput, scale)
+         if not self.grads then
+            self.grads = self.b({input=input, weight=self.weight, bias=self.bias}, gradOutput)
+         end
+
          if self.weight then
-            if not self.grads then
-               self.grads = self.b({input=input, weight=self.weight, bias=self.bias}, gradOutput)
-            end
             self.gradWeight:add(scale, self.grads.weight)
+         end
+
+         if self.bias then
             self.gradBias:add(scale, self.grads.bias)
          end
+
       end
    end
    local module = auto[moduleName]
