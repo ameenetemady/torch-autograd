@@ -1,11 +1,12 @@
 local Source = require 'autograd.runtime.codegen.Source'
 local Value = require 'autograd.runtime.codegen.Value'
-local StringBuilder = require 'autograd.StringBuilder'
+local StringBuilder = require 'autograd.runtime.codegen.StringBuilder'
 local stringx = require 'pl.stringx'
 
 local function Debugger(opt)
    opt = opt or { }
    local debugHook = opt.debugHook
+   local newlineChar = opt.newlineChar or "\n"
 
    local debugNodes = { }
    local function debugNode(node)
@@ -132,7 +133,7 @@ local function Debugger(opt)
             color = "red"
          end
       end
-      out.write('\t' .. valueKey(value) .. ' [label="<' .. table.concat(parts, '<BR/>') .. '>" color="' .. color .. '" shape="' .. shape .. '"];\n')
+      out:write('\t' .. valueKey(value) .. ' [label="<' .. table.concat(parts, newlineChar) .. '>" color="' .. color .. '" shape="' .. shape .. '"];\n')
    end
 
    local function generateDotNode(out, node)
@@ -145,41 +146,65 @@ local function Debugger(opt)
             local forwardNode = rcsvFindCallStack(node)
             if forwardNode then
                for i,info in ipairs(forwardNode.debug.callStack) do
-                  label = label .. "<BR/>" .. i .. ": " .. tostring(info.name) .. info.source .. ":" .. info.currentline
+                  label = label .. newlineChar .. i .. ": " .. tostring(info.name) .. info.source .. ":" .. info.currentline
                end
             end
          end
       end
-      out.write('\tnode' .. node.debug.index .. ' [label="<' .. label .. '>" color="'..color..'" shape="box"];\n')
+      out:write('\tnode' .. node.debug.index .. ' [label="<' .. label .. '>" color="'..color..'" shape="box"];\n')
    end
 
    local function generateEdge(out, node, value, reverse)
       local color = (node.debug.isForward and 'green') or 'blue'
       if reverse then
-         out.write('\t' .. valueKey(value) .. ' -> node' .. node.debug.index .. ' [color="'..color..'"];\n')
+         out:write('\t' .. valueKey(value) .. ' -> node' .. node.debug.index .. ' [color="'..color..'"];\n')
       else
-         out.write('\tnode' .. node.debug.index .. ' -> ' .. valueKey(value) .. ' [color="'..color..'"];\n')
+         out:write('\tnode' .. node.debug.index .. ' -> ' .. valueKey(value) .. ' [color="'..color..'"];\n')
       end
    end
 
    local function generateDot(fileName, value, node)
-      local out = StringBuilder(fileName)
-      out.write('digraph graphname {\n')
-      local seen = { }
+      local out = StringBuilder.new()
+      out:write('digraph graphname {\n')
+      local seenNodes = { }
+      local seenEdges = { }
       local function callback(value, node, parentNode)
-         if value and not seen[value] then
-            seen[value] = true
+         if value and not seenNodes[value] then
+            seenNodes[value] = true
             generateDotValue(out, value)
          end
-         if node and not seen[node] then
-            seen[node] = true
+         if node and not seenNodes[node] then
+            seenNodes[node] = true
             generateDotNode(out, node)
          end
+
          if node and value then
-            generateEdge(out, node, value)
+            local shouldDraw = false
+            if seenEdges[node] and not seenEdges[node][value] then
+               seenEdges[node][value] = true
+               shouldDraw = true
+            elseif not seenEdges[node] then
+               seenEdges[node] = {}
+               seenEdges[node][value] = true
+               shouldDraw = true
+            end
+            if shouldDraw then
+               generateEdge(out, node, value)
+            end
          end
+
          if parentNode and value then
-            generateEdge(out, parentNode, value, true)
+            local shouldDraw = false
+            if not seenEdges[parentNode] then
+               seenEdges[parentNode] = {}
+            end
+            if not seenEdges[parentNode][value] then
+               seenEdges[parentNode][value] = true
+               shouldDraw = true
+            end
+            if shouldDraw then
+               generateEdge(out, parentNode, value, true)
+            end
          end
       end
       if value then
@@ -188,14 +213,16 @@ local function Debugger(opt)
       else
          -- Walk the entire graph
          for _,grad in ipairs(main.grads) do
-            walkGraph(grad.grad, nil, nil, callback)
+            walkGraph(grad.grad, grad.grad.source.node, nil, callback)
          end
          for _,answer in ipairs(main.answers) do
-            walkGraph(answer, nil, nil, callback)
+            walkGraph(answer, answer.source.node, nil, callback)
          end
       end
-      out.write('}\n')
-      return out.finish()
+      out:write('}\n')
+      local f = io.open(fileName, "w")
+      f:write(out:finish())
+      f:close()
    end
 
    local function generateJson(fileName, value, node)
@@ -312,9 +339,9 @@ local function Debugger(opt)
       end
       local output = node.outputs[outputIndex]
       if output.type == Value.TENSOR then
-         out.write("    debugger.outputCheckTensor(" .. table.concat({ node.debug.index, outputIndex, symbol }, ", ") .. ")\n")
+         out:write("    debugger.outputCheckTensor(" .. table.concat({ node.debug.index, outputIndex, symbol }, ", ") .. ")\n")
       elseif output.type == Value.NUMBER then
-         out.write("    debugger.outputCheckNumber(" .. table.concat({ node.debug.index, outputIndex, symbol }, ", ") .. ")\n")
+         out:write("    debugger.outputCheckNumber(" .. table.concat({ node.debug.index, outputIndex, symbol }, ", ") .. ")\n")
       end
    end
 
@@ -331,9 +358,9 @@ local function Debugger(opt)
    local function generateInputCheck(value, symbol, out)
       debugValue(value)
       if value.type == Value.TENSOR then
-         out.write("    debugger.inputCheckTensor(" .. table.concat({ value.debug.index, symbol }, ", ") .. ")\n")
+         out:write("    debugger.inputCheckTensor(" .. table.concat({ value.debug.index, symbol }, ", ") .. ")\n")
       elseif value.type == Value.NUMBER then
-         out.write("    debugger.inputCheckNumber(" .. table.concat({ value.debug.index, symbol }, ", ") .. ")\n")
+         out:write("    debugger.inputCheckNumber(" .. table.concat({ value.debug.index, symbol }, ", ") .. ")\n")
       elseif value.type == Value.TABLE then
          for k,v in pairs(value.raw) do
             generateInputCheck(v, symbol .. "." .. k, out)

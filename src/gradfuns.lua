@@ -16,7 +16,7 @@ end
 -- Utility for defining gradients that are zero
 local function zeroGradient(nArgs)
    nArgs = nArgs or 2
-   zeroGrads = {}
+   local zeroGrads = {}
    for i=1,nArgs do
       zeroGrads[i] = function(...) return nil end
    end
@@ -224,6 +224,50 @@ operators.pow = {
    end
 }
 
+-- Define some gradients that will be shared by the class and the torch module
+-- e.g. torch.view(x,3,3) and x:view(3,3)
+local viewGradients = {
+   function(g, ans, x,sizes)
+      return torch.view(torch.contiguous(g), torch.size(x))
+   end
+}
+local viewAsGradients = {
+   function(g, ans, x,template)
+      return torch.clone(torch.viewAs(g,x))
+   end,
+   function(g, ans, x,template)
+      return nil
+   end
+}
+local expandGradients = {
+   function(g, ans, x,...)
+      local xSizes = torch.size(x):totable()
+      local out = g
+      for dim,size in pairs(xSizes) do
+         if size == 1 then
+            out = torch.sum(out,dim)
+         end
+      end
+      return out
+   end
+}
+local expandAsGradients = {
+   function(g, ans, x, template)
+      local sizes = torch.size(x):totable()
+      local out = g
+      for dim,size in pairs(sizes) do
+         if size == 1 then
+            out = torch.sum(out, dim)
+         end
+      end
+      return out
+   end,
+   function(g, ans, x,template)
+      return nil
+   end
+}
+
+
 overload.module("torch", torch, function(module)
    local tensorTypes = {"FloatTensor", "DoubleTensor", "CudaTensor"}
    for i = 1, #tensorTypes do
@@ -236,6 +280,10 @@ overload.module("torch", torch, function(module)
             class.gradient("cat", functions.catGradient)
             class.initializer("new")
             class.static("dim", "size", "nDimension", "nElement")
+            class.gradient("view", viewGradients)
+            class.gradient("viewAs", viewAsGradients)
+            class.gradient("expand", expandGradients)
+            class.gradient("expandAs", expandAsGradients)
             class.defaultUnsupported()
          end)
       end
@@ -283,7 +331,7 @@ overload.module("torch", torch, function(module)
    })
    module.gradient("tanh", {
       function(g, ans, x)
-         local mzz = 1 - torch.cmul(ans, ans)
+         local mzz = 1 - elemwiseMul(ans,ans)
          return elemwiseMul(g, mzz)
       end
    })
@@ -313,7 +361,7 @@ overload.module("torch", torch, function(module)
       function(g, ans, x, minVal, maxVal)
          -- NOTE: could do a casting and then multiply for 2nd order divs. This is more efficient for now.
          local mask = torch.typeAs(torch.eq(torch.ne(ans,minVal),torch.ne(ans,maxVal)), g)
-         return torch.cmul(g, mask)
+         return elemwiseMul(g, mask)
       end,
       function(g, ans, x, minVal, maxVal)
          error("Gradient not implemented w.r.t. min and max values of torch.clamp")
@@ -328,46 +376,10 @@ overload.module("torch", torch, function(module)
       end
    })
    module.gradient("cat", functions.catGradient)
-   module.gradient("expand", {
-      function(g, ans, x,...)
-         local xSizes = torch.size(x):totable()
-         local out = g
-         for dim,size in pairs(xSizes) do
-            if size == 1 then
-               out = torch.sum(out,dim)
-            end
-         end
-         return out
-      end
-   })
-   module.gradient("expandAs", {
-      function(g, ans, x, template)
-         local sizes = torch.size(x):totable()
-         local out = g
-         for dim,size in pairs(sizes) do
-            if size == 1 then
-               out = torch.sum(out, dim)
-            end
-         end
-         return out
-      end,
-      function(g, ans, x,template)
-         return nil
-      end
-   })
-   module.gradient("view", {
-      function(g, ans, x,sizes)
-         return torch.view(util.makeContiguous(g), torch.size(x))
-      end
-   })
-   module.gradient("viewAs", {
-      function(g, ans, x,template)
-         return torch.clone(torch.viewAs(g,x))
-      end,
-      function(g, ans, x,template)
-         return nil -- g.new(template:size()):zero()
-      end
-   })
+   module.gradient("expand", expandGradients)
+   module.gradient("expandAs", expandAsGradients)
+   module.gradient("view", viewGradients)
+   module.gradient("viewAs", viewAsGradients)
    module.gradient("clone", {
       function(g, ans, x)
          return g
@@ -450,6 +462,9 @@ overload.module("torch", torch, function(module)
    module.gradient("log", {
       function(g, ans, x) return elemwiseDiv(g,x) end
    })
+   module.gradient("log1p", {
+      function(g, ans, x) return elemwiseDiv(g,x + 1) end
+   })
    module.gradient("min", {
       function(g, ans, x,axis)
          local repeater = repeatToMatchShape(x,axis)
@@ -464,6 +479,24 @@ overload.module("torch", torch, function(module)
          return out
       end
    })
+
+   module.gradient("cmin", {
+      function(g, ans, x, y)
+         return util.setNotEqual(x, ans, 0, g)
+      end,
+      function(g, ans, x, y)
+         return util.setNotEqual(y, ans, 0, g)
+      end
+   })
+   module.gradient("cmax", {
+      function(g, ans, x, y)
+         return util.setNotEqual(x, ans, 0, g)
+      end,
+      function(g, ans, x, y)
+         return util.setNotEqual(y, ans, 0, g)
+      end
+   })
+
    module.gradient("transpose", {
       function(g, ans, x, d1, d2)
          return torch.transpose(g, d1, d2)
@@ -500,7 +533,7 @@ overload.module("torch", torch, function(module)
          local Dx = torch.nDimension(x)
          for i=Dx,1,-1 do
             local D = torch.nDimension(g)
-            local c = torch.cat(torch.split(g,torch.size(x,i), Dg-Dx+i), D+1)
+            local c = util.cat(torch.split(g,torch.size(x,i), Dg-Dx+i), D+1)
             g = torch.squeeze(torch.sum(c,D+1))
          end
          for i=1,Dg-Dx do
@@ -519,6 +552,12 @@ overload.module("torch", torch, function(module)
          return torch.viewAs(g, x)
       end
    })
+   module.gradient("sigmoid", {
+      function(g, ans, x)
+         local p = elemwiseMul(1-ans,ans)
+         return elemwiseMul(g, p)
+      end
+   })
    -- module.gradient("split", {
    --    function(g, ans, x, size, dim)
    --       -- TODO: untested, not sure if we support table output
@@ -528,6 +567,65 @@ overload.module("torch", torch, function(module)
    --    function(g, ans, x, size, dim) return nil end,
 
    -- })
+
+   module.gradient("bmm", {
+      function(g, ans, x, y) return torch.bmm(g, torch.transpose(y, 3, 2)) end,
+      function(g, ans, x, y) return torch.bmm(torch.transpose(x, 3, 2), g) end,
+   })
+   module.gradient("baddbmm", {
+      -- baddbmm has three possible patterns:
+      -- 1.)  M  X  Y
+      -- 2.) v1  M  X  Y
+      -- 3.) v1  M v2  X  Y
+      function(g, ans, a1, a2, a3, a4, a5)
+         -- grad wrt a1
+         if torch.isTensor(a1) then
+            -- pattern 1
+            return g
+         else
+            -- patterns 2 and 3
+            return torch.sum(elemwiseMul(g, a2))
+         end
+      end,
+      function(g, ans, a1, a2, a3, a4, a5)
+         -- grad wrt a2
+         if torch.isTensor(a1) then
+            -- pattern 1
+            return torch.bmm(g, torch.transpose(a3, 3, 2))
+         else
+            -- patterns 2 and 3
+            return elemwiseMul(g, a1)
+         end
+      end,
+      function(g, ans, a1, a2, a3, a4, a5)
+         -- grad wrt a3
+         if torch.isTensor(a1) then
+            -- pattern 1
+            return torch.bmm(torch.transpose(a2, 3, 2), g)
+         elseif torch.isTensor(a3) then
+            -- pattern 2
+            return torch.bmm(g, torch.transpose(a4, 3, 2))
+         else
+            -- pattern 3
+            return torch.sum(elemwiseMul(g, torch.bmm(a4, a5)))
+         end
+      end,
+      function(g, ans, a1, a2, a3, a4, a5)
+         -- grad wrt a4
+         if torch.isTensor(a3) then
+            -- pattern 2
+            return torch.bmm(torch.transpose(a3, 3, 2), g)
+         else
+            -- pattern 3
+            return elemwiseMul(torch.bmm(g, torch.transpose(a5, 3, 2)), a3)
+         end
+      end,
+      function(g, ans, a1, a2, a3, a4, a5)
+         -- grad wrt a5
+         -- pattern 3
+         return elemwiseMul(torch.bmm(torch.transpose(a4, 3, 2), g), a3)
+      end,
+   })
 
    -- Zero gradients
    module.gradient("lt", zeroGradient())
@@ -570,12 +668,6 @@ overload.module("DirectNode", DirectNode, function(module)
 end)
 
 overload.module("util", util, function(module)
-   module.gradient("sigmoid", {
-      function(g, ans, x)
-         local p = torch.cmul(1 - ans, ans)
-         return torch.cmul(g, p)
-      end
-   })
    module.gradient("fill", {
       function(g, ans, template, x)
          return nil
@@ -609,7 +701,6 @@ overload.module("util", util, function(module)
       function(g, ans, x, template, dim, index) return nil end,
       function(g, ans, x, template, dim, index) return nil end,
    })
-   module.gradient("makeContiguous", zeroGradient())
    module.gradient("cat", functions.catGradient)
    module.static("lt")
    module.static("le")

@@ -1,10 +1,10 @@
 -- Tester:
-local totem = require 'totem'
+local torch = require 'torch'
 local autograd = require 'autograd'
 local util = require 'autograd.util'
 local gradcheck = require 'autograd.gradcheck' {randomizeInput = true}
 local gradcheckConstant = require 'autograd.gradcheck' {randomizeInput = false}
-local tester = totem.Tester()
+local tester = torch.Tester()
 local stringx = require 'pl.stringx'
 
 autograd.protected(true)
@@ -86,7 +86,7 @@ local tests = {
    AutoModuleLoaded = function()
       local inputSize = 24
       local outputSize = 848
-      local version = (jit and 'JIT') or (_VERSION:find('5%.1') and '51') or (_VERSION:find('5%.2') and '52') or assert('version of Lua not supported: ', _VERSION)
+      local version = (jit and 'JIT') or (_VERSION:find('5%.1') and '51') or (_VERSION:find('5%.2') and '52') or (_VERSION:find('5%.3') and '53') or assert('version of Lua not supported: ', _VERSION)
       local mseCriterion = torch.load(sys.fpath()..'/data/criterion.th.'..version)
       local model = torch.load(sys.fpath()..'/data/model.th.'..version)
       local autoModel = torch.load(sys.fpath()..'/data/autoModel.th.'..version)
@@ -242,6 +242,36 @@ local tests = {
       tester:assert(gradcheck(f, {x=x}), "Incorrect gradient")
    end,
 
+   SelfView = function()
+      local W = torch.Tensor(5,5):normal()
+      local x = torch.Tensor(1,25):normal()
+
+      -- Function:
+      local viewFn = function(inputs)
+         return torch.sum(inputs.x:view(5,5) + inputs.W)
+      end
+      local viewAsFn = function(inputs)
+         return torch.sum(inputs.x:viewAs(inputs.W) + inputs.W)
+      end
+
+      -- Check grads:
+      tester:assert(gradcheck(viewFn, {W=W,x=x}), "Incorrect gradient")
+      tester:assert(gradcheck(viewAsFn, {W=W,x=x}), "Incorrect gradient")
+
+      -- Check floating point
+      gd = autograd(viewFn)({W=W,x=x})
+      gf = autograd(viewFn)({W=W:float(),x=x:float()})
+      tester:assertTensorEq(gd.W, gf.W:double(), 1e-8, "Incorrect floating point gradient")
+      tester:assertTensorEq(gd.x, gf.x:double(), 1e-8, "Incorrect floating point gradient")
+
+      gd = autograd(viewAsFn)({W=W,x=x})
+      gf = autograd(viewAsFn)({W=W:float(),x=x:float()})
+      tester:assertTensorEq(gd.W, gf.W:double(), 1e-8, "Incorrect floating point gradient")
+      tester:assertTensorEq(gd.x, gf.x:double(), 1e-8, "Incorrect floating point gradient")
+
+
+   end,
+
    View = function()
       local W = torch.Tensor(5,5):normal()
       local x = torch.Tensor(1,25):normal()
@@ -257,7 +287,43 @@ local tests = {
       -- Check grads:
       tester:assert(gradcheck(viewFn, {W=W,x=x}), "Incorrect gradient")
       tester:assert(gradcheck(viewAsFn, {W=W,x=x}), "Incorrect gradient")
+
+      -- Check floating point
+      gd = autograd(viewFn)({W=W,x=x})
+      gf = autograd(viewFn)({W=W:float(),x=x:float()})
+      tester:assertTensorEq(gd.W, gf.W:double(), 1e-8, "Incorrect floating point gradient")
+      tester:assertTensorEq(gd.x, gf.x:double(), 1e-8, "Incorrect floating point gradient")
+
    end,
+
+   SelfExpand = function()
+      local W = torch.Tensor(32,100):normal()
+      local x1 = torch.Tensor(1,100):normal()
+      local x2 = torch.Tensor(32,1):normal()
+      local x3 = torch.Tensor(1,1):normal()
+
+      -- Function:
+      local expandFn = function(inputs)
+         return torch.sum(torch.sum(inputs.x:expand(32,100) + inputs.W, 2))
+      end
+      local expandAsFn = function(inputs)
+         return torch.sum(torch.sum(inputs.x:expandAs(inputs.W) + inputs.W, 2))
+      end
+
+      -- Check grads:
+      for ix,x in pairs({x1,x2,x3}) do
+         tester:assert(gradcheck(expandFn, {W=W, x=x}), "Incorrect gradient")
+         tester:assert(gradcheck(expandAsFn, {W=W, x=x}), "Incorrect gradient")
+      end
+      -- Check floating point
+      for ix,x in pairs({x1,x2,x3}) do
+         gd = autograd(expandFn)({W=W,x=x})
+         gf = autograd(expandFn)({W=W:float(),x=x:float()})
+         tester:assertTensorEq(gd.W, gf.W:double(), 1e-8, "Incorrect floating point gradient")
+         tester:assertTensorEq(gd.x, gf.x:double(), 1e-8, "Incorrect floating point gradient")
+      end
+
+ end,
 
    Expand = function()
       local W = torch.Tensor(32,100):normal()
@@ -278,8 +344,15 @@ local tests = {
          tester:assert(gradcheck(expandFn, {W=W, x=x}), "Incorrect gradient")
          tester:assert(gradcheck(expandAsFn, {W=W, x=x}), "Incorrect gradient")
       end
-   end,
+      -- Check floating point
+      for ix,x in pairs({x1,x2,x3}) do
+         gd = autograd(expandFn)({W=W,x=x})
+         gf = autograd(expandFn)({W=W:float(),x=x:float()})
+         tester:assertTensorEq(gd.W, gf.W:double(), 1e-8, "Incorrect floating point gradient")
+         tester:assertTensorEq(gd.x, gf.x:double(), 1e-8, "Incorrect floating point gradient")
+      end
 
+ end,
    Transpose = function()
       local fn = function(inputs)
          return torch.sum(torch.t(inputs.x))
@@ -517,6 +590,24 @@ local tests = {
          tester:asserteq(grads.W:size(1), 5, 'incorrect dims for gradients')
          tester:asserteq(grads.W:size(2), 5, 'incorrect dims for gradients')
          tester:assert(gradcheck(func1, {W=W}), 'incorrect gradients')
+      end
+   end,
+
+   CMinCMax = function()
+      local fns = {"cmin", "cmax"}
+      local preds = {{1,5},{2,10}}
+
+      for i=1,2 do
+         local A = torch.eye(5)
+         local B = torch.eye(5)*2
+         local fn = fns[i]
+
+         local fn = function(inputs)
+            return torch.sum(torch[fn](inputs.A,inputs.B))
+         end
+
+         tester:assert(gradcheck(fn, {A=A,B=B}), 'incorrect gradients')
+
       end
    end,
 
@@ -1094,8 +1185,58 @@ local tests = {
          return torch.sum(v)
       end
 
-      -- Move to Float
-      params = autograd.util.cast(params, "double")
+      -- Test on sequence data:
+      local o = loss(params, i)
+      local g = autograd(loss)(params, i)
+
+      -- Checks
+      tester:asserteq(type(g), 'table', 'gradients could not be computed')
+      tester:assert(gradcheck(loss, params, i), 'incorrect gradients')
+   end,
+
+   Models_RecurrentGRUNetwork = function()
+      -- Define RNN:
+      local f,params = autograd.model.RecurrentGRUNetwork({
+         inputFeatures = 10,
+         hiddenFeatures = 10,
+         outputType = 'last',
+      })
+
+      -- Params:
+      params[1].W:normal(0,0.01)
+      params[1].b:normal(0,0.01)
+      params[1].V:normal(0,0.01)
+      params[1].c:normal(0,0.01)
+
+      -- Loss
+      local loss = function(params, input)
+         local v = f(params, input)
+         return torch.sum(v)
+      end
+
+      -- Test on sequence data:
+      local i = torch.randn(13, 10)
+      local o = loss(params, i)
+      local g = autograd(loss)(params, i)
+
+      -- Checks
+      tester:asserteq(type(g), 'table', 'gradients could not be computed')
+
+      -- Gradcheck:
+      tester:assert(gradcheck(loss, params, i), 'incorrect gradients')
+
+      -- Define RNN with all states exposed:
+      local f,params = autograd.model.RecurrentGRUNetwork({
+         inputFeatures = 10,
+         hiddenFeatures = 10,
+         outputType = 'all',
+      })
+
+      -- Loss
+      local loss = function(params, input)
+         local v = f(params, input)
+         return torch.sum(v)
+      end
 
       -- Test on sequence data:
       local o = loss(params, i)
@@ -1103,6 +1244,7 @@ local tests = {
 
       -- Checks
       tester:asserteq(type(g), 'table', 'gradients could not be computed')
+      tester:assert(gradcheck(loss, params, i), 'incorrect gradients')
    end,
 
    DebuggerDivZero = function()
@@ -1212,8 +1354,7 @@ local tests = {
             loss3 = loss3 + loss / nData
          end
       end
-
-      tester:asserteq(loss1, loss3, 'sgd wrapper should produce same loss')
+      tester:assert(math.abs(loss1 - loss3) < 1e-6, 'sgd wrapper should produce same loss')
    end,
 
    OptimNN = function()
@@ -1399,6 +1540,10 @@ local tests = {
          return torch.sum(y)
       end
       tester:assert(gradcheck(f2to2, {x=torch.randn(3,3)}), "Incorrect gradient")
+      x = torch.randn(3,3)
+      local o_double = autograd(f2to2)({x=x}).x
+      local o_float = autograd(f2to2)({x=x:float()}).x
+      tester:assertTensorEq(o_double, o_float:double(), 1e-10, "Incorrect floating point gradient")
 
       local function f3to3(params)
          local y = torch.repeatTensor(params.x, 2, 2, 2)*3
@@ -1544,23 +1689,85 @@ local tests = {
       tester:assert(gradcheck(f4,{x=torch.randn(10,10),y=torch.randn(3)}), "Incorrect gradient")
    end,
 
+   ScalarSigmoid = function()
+      params = {w = 1}
+      f = function(params, x)
+         return torch.sigmoid(params.w * x)
+      end
+      df = autograd(f)
+      dparams, loss = df(params, 2)
+   end,
 
+   Contiguous = function()
+         -- Parameters:
+      local W = torch.Tensor(32,100):fill(.5)
+      local x = torch.Tensor(100):fill(.5)
+
+      -- Function:
+      local f1 = function(inputs)
+         return torch.sum(torch.contiguous(torch.contiguous(inputs.W)) * torch.contiguous(torch.contiguous(inputs.x)))
+      end
+
+      -- Tests:
+      tester:assert(gradcheck(f1,{W=torch.Tensor(32,100):fill(.5),x=torch.Tensor(100):fill(.5)}), "Incorrect gradient")
+   end,
+
+   Bmm = function()
+      local X = torch.randn(5, 4, 3)
+      local Y = torch.randn(5, 3, 2)
+
+      local bmmFn = function(inputs)
+         return torch.sum(torch.bmm(inputs.X, inputs.Y))
+      end
+      tester:assert(gradcheck(bmmFn, {X=X, Y=Y}), "Incorrect gradient")
+   end,
+
+   Baddbmm = function()
+      local v1 = torch.randn(1)[1]
+      local v2 = torch.randn(1)[1]
+      local M = torch.randn(5, 4, 2)
+      local X = torch.randn(5, 4, 3)
+      local Y = torch.randn(5, 3, 2)
+
+      local baddbmm3argFn = function(inputs)
+         return torch.sum(torch.baddbmm(inputs.M, inputs.X, inputs.Y))
+      end
+      tester:assert(gradcheck(baddbmm3argFn, {M=M, X=X, Y=Y}), "Incorrect gradient")
+
+      local baddbmm4argFn = function(inputs)
+         return torch.sum(torch.baddbmm(inputs.v1, inputs.M, inputs.X, inputs.Y))
+      end
+      tester:assert(gradcheck(baddbmm4argFn, {v1=v1, M=M, X=X, Y=Y}), "Incorrect gradient")
+
+      local baddbmm5argFn = function(inputs)
+         return torch.sum(torch.baddbmm(inputs.v1, inputs.M, inputs.v2, inputs.X, inputs.Y))
+      end
+      tester:assert(gradcheck(baddbmm5argFn, {v1=v1, v2=v2, M=M, X=X, Y=Y}), "Incorrect gradient")
+   end
 }
 
 local function prefixTests(pf, t, skip)
    local nt = { }
-   for k, v in pairs(t) do
-      if not skip[k] then
-         nt[pf .. k] = v
+   if type(t) == "table" then
+      for k, v in pairs(t) do
+         if not skip[k] then
+            nt[pf .. k] = v
+         end
       end
+   elseif type(t) == "string" then
+      nt = pf .. t
+   elseif type(t) == "nil" then
+      nt = nil
    end
    return nt
 end
 
+
 -- Run tests:
+print(prefixTests("Optimized_", tests, { }))
 autograd.optimize(true)
-tester:add(prefixTests("Optimized_", tests, { })):run()
+tester:add(prefixTests("Optimized_", tests, { })):run(prefixTests("Optimized_", arg[1]))
 autograd.optimize(false)
-tester = totem.Tester()
-tester:add(prefixTests("Direct_", tests, { GradGrad = true, AutoModule = true, DebuggerDivZero = true, StableGradients = true, ZeroGrad = true, SimpleGradGrad = true })):run()
+tester = torch.Tester()
+tester:add(prefixTests("Direct_", tests, { GradGrad = true, AutoModule = true, DebuggerDivZero = true, StableGradients = true, ZeroGrad = true, SimpleGradGrad = true })):run(arg[1])
 
